@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model files (if they're too large for GitHub)
+# Uncomment if needed:
+# *.pth
+# *.pt
+# *.h5
+
+# Dataset folders (if you have large datasets)
+data/
+dataset/
+datasets/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

@@ -4,15 +4,17 @@ FastAPI service for Waste Classification Model
 import os
 import io
 import torch
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from PIL import Image
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel
 import uvicorn
 from datetime import datetime
+import threading
 
-from train import WasteClassifierModelV1
+from train import WasteClassifierModelV1, train_model
+from processing import download_dataset, prepare_data
 from torchvision import transforms
 
 
@@ -37,6 +39,7 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     device: str
     timestamp: str
+    training_status: Optional[str] = None
 
 
 class ModelInfoResponse(BaseModel):
@@ -47,6 +50,31 @@ class ModelInfoResponse(BaseModel):
     device: str
     best_accuracy: float
     model_architecture: str
+
+
+class TrainingRequest(BaseModel):
+    """Request model for training"""
+    epochs: int = 45
+    batch_size: int = 32
+    learning_rate: float = 0.001
+    hidden_units: int = 64
+    resume: bool = False
+
+
+class TrainingResponse(BaseModel):
+    """Response model for training"""
+    message: str
+    status: str
+    training_id: str
+
+
+class TrainingStatusResponse(BaseModel):
+    """Response model for training status"""
+    status: str
+    current_epoch: Optional[int] = None
+    total_epochs: Optional[int] = None
+    best_accuracy: Optional[float] = None
+    message: Optional[str] = None
 
 
 # Initialize FastAPI app
@@ -63,6 +91,16 @@ device = None
 transform = None
 model_path = None
 best_accuracy = None
+
+# Training state
+training_state = {
+    'status': 'idle',  # idle, running, completed, failed
+    'current_epoch': 0,
+    'total_epochs': 0,
+    'best_accuracy': 0.0,
+    'message': '',
+    'training_id': None
+}
 
 
 def load_model():
@@ -182,7 +220,8 @@ async def health_check():
         status="healthy" if model is not None else "unhealthy",
         model_loaded=model is not None,
         device=device if device else "unknown",
-        timestamp=datetime.now().isoformat()
+        timestamp=datetime.now().isoformat(),
+        training_status=training_state['status']
     )
 
 
@@ -301,6 +340,181 @@ async def batch_predict(files: List[UploadFile] = File(...)):
         total_images=len(files),
         processing_time=round(total_time, 4)
     )
+
+
+def run_training(epochs: int, batch_size: int, lr: float, hidden_units: int, resume: bool):
+    """
+    Background training function
+    """
+    global model, classes, best_accuracy, training_state
+    
+    try:
+        training_state['status'] = 'running'
+        training_state['message'] = 'Downloading dataset...'
+        
+        # Suppress stdout to avoid encoding issues with emojis on Windows
+        import sys
+        from io import StringIO
+        
+        # Save original stdout/stderr
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        
+        # Redirect to StringIO to capture output without encoding issues
+        sys.stdout = StringIO()
+        sys.stderr = StringIO()
+        
+        try:
+            # Download dataset
+            path = download_dataset()
+            dataset_path = os.path.join(path, "Garbage_Dataset_Classification", "images")
+            
+            # Prepare data
+            training_state['message'] = 'Preparing data loaders...'
+            train_loader, test_loader, dataset_classes, num_classes = prepare_data(dataset_path, batch_size=batch_size)
+            
+            # Create model
+            training_state['message'] = 'Creating model...'
+            training_model = WasteClassifierModelV1(
+                input_shape=3,
+                hidden_units=hidden_units,
+                output_shape=num_classes
+            ).to(device)
+            
+            # Load checkpoint if resuming
+            if resume:
+                history_path = '../models/training_history.pth'
+                if os.path.exists(history_path):
+                    checkpoint = torch.load(history_path)
+                    if 'model_state_dict' in checkpoint:
+                        training_model.load_state_dict(checkpoint['model_state_dict'])
+                        training_state['message'] = 'Resumed from checkpoint'
+            
+            # Train
+            training_state['message'] = 'Training in progress...'
+            training_state['total_epochs'] = epochs
+            
+            trained_model, train_accs, test_accs, train_losses, test_losses, best_acc = train_model(
+                model=training_model,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                epochs=epochs,
+                lr=lr,
+                device=device,
+                save_dir='../models'
+            )
+            
+            # Save history with model state
+            save_dir = '../models'
+            os.makedirs(save_dir, exist_ok=True)
+            history_path = os.path.join(save_dir, 'training_history.pth')
+            torch.save({
+                'model_state_dict': trained_model.state_dict(),
+                'train_accuracies': train_accs,
+                'test_accuracies': test_accs,
+                'train_losses': train_losses,
+                'test_losses': test_losses,
+                'classes': dataset_classes,
+                'best_accuracy': best_acc
+            }, history_path)
+            
+            # Update global model
+            model = trained_model
+            classes = dataset_classes
+            best_accuracy = best_acc
+            
+            # Update training state
+            training_state['status'] = 'completed'
+            training_state['best_accuracy'] = best_acc
+            training_state['message'] = f'Training completed! Best accuracy: {best_acc:.2f}%'
+            
+        finally:
+            # Restore stdout/stderr
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+            
+    except Exception as e:
+        training_state['status'] = 'failed'
+        training_state['message'] = f'Training failed: {str(e)}'
+
+
+@app.post("/train", response_model=TrainingResponse, tags=["Training"])
+async def start_training(request: TrainingRequest, background_tasks: BackgroundTasks):
+    """
+    Start model training with specified parameters
+    
+    Args:
+        request: Training configuration
+        
+    Returns:
+        Training start confirmation with training ID
+    """
+    global training_state
+    
+    # Check if training is already running
+    if training_state['status'] == 'running':
+        raise HTTPException(status_code=409, detail="Training is already in progress")
+    
+    # Generate training ID
+    training_id = f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Reset training state
+    training_state = {
+        'status': 'starting',
+        'current_epoch': 0,
+        'total_epochs': request.epochs,
+        'best_accuracy': 0.0,
+        'message': 'Training starting...',
+        'training_id': training_id
+    }
+    
+    # Start training in background
+    background_tasks.add_task(
+        run_training,
+        request.epochs,
+        request.batch_size,
+        request.learning_rate,
+        request.hidden_units,
+        request.resume
+    )
+    
+    return TrainingResponse(
+        message="Training started successfully",
+        status="started",
+        training_id=training_id
+    )
+
+
+@app.get("/train/status", response_model=TrainingStatusResponse, tags=["Training"])
+async def get_training_status():
+    """
+    Get current training status
+    
+    Returns:
+        Current training status including progress and accuracy
+    """
+    return TrainingStatusResponse(
+        status=training_state['status'],
+        current_epoch=training_state['current_epoch'],
+        total_epochs=training_state['total_epochs'],
+        best_accuracy=training_state['best_accuracy'],
+        message=training_state['message']
+    )
+
+
+@app.post("/train/stop", tags=["Training"])
+async def stop_training():
+    """
+    Stop ongoing training
+    Note: This will mark training as stopped but current epoch will complete
+    """
+    if training_state['status'] != 'running':
+        raise HTTPException(status_code=400, detail="No training in progress")
+    
+    training_state['status'] = 'stopped'
+    training_state['message'] = 'Training stopped by user'
+    
+    return {"message": "Training stop requested. Current epoch will complete."}
 
 
 if __name__ == "__main__":

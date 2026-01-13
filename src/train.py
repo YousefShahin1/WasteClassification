@@ -141,7 +141,7 @@ def test_step(data_loader: torch.utils.data.DataLoader,
         return test_loss, test_acc
 
 
-def train_model(model, train_loader, test_loader, epochs=45, lr=0.001, device='cpu'):
+def train_model(model, train_loader, test_loader, epochs=45, lr=0.001, device='cpu', save_dir='models'):
     """
     Train the model
     
@@ -152,9 +152,10 @@ def train_model(model, train_loader, test_loader, epochs=45, lr=0.001, device='c
         epochs: Number of training epochs
         lr: Learning rate
         device: Device to train on
+        save_dir: Directory to save the best model
         
     Returns:
-        model, train_accuracies, test_accuracies, train_losses, test_losses
+        model, train_accuracies, test_accuracies, train_losses, test_losses, best_accuracy
     """
     # Setup loss and optimizer
     loss_fn = nn.CrossEntropyLoss()
@@ -165,14 +166,17 @@ def train_model(model, train_loader, test_loader, epochs=45, lr=0.001, device='c
         optimizer,
         mode='max',
         factor=0.5,
-        patience=3,
-        verbose=True,
+        patience=3
     )
     
     train_accuracies = []
     test_accuracies = []
     train_losses = []
     test_losses = []
+    best_acc = 0.0
+    
+    # Create save directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
     
     # Measure time
     train_time_start = timer()
@@ -203,12 +207,19 @@ def train_model(model, train_loader, test_loader, epochs=45, lr=0.001, device='c
         train_losses.append(train_loss)
         test_losses.append(test_loss)
         
+        # Save best model
+        if test_acc > best_acc:
+            best_acc = test_acc
+            model_path = os.path.join(save_dir, 'best_model.pth')
+            torch.save(model.state_dict(), model_path)
+            print(f"New best accuracy: {best_acc:.4f}% - Model saved to {model_path}")
+        
         scheduler.step(test_acc)
     
     train_time_end = timer()
     print_train_time(start=train_time_start, end=train_time_end, device=device)
     
-    return model, train_accuracies, test_accuracies, train_losses, test_losses
+    return model, train_accuracies, test_accuracies, train_losses, test_losses, best_acc
 
 
 def save_model(model, filepath='waste_classifier_model.pth'):
@@ -227,6 +238,7 @@ def parse_args():
     parser.add_argument('--save-dir', type=str, default='../models', help='Directory to save models (default: ../models)')
     parser.add_argument('--history-path', type=str, default='../models/training_history.pth', help='Path to save training history (default: ../models/training_history.pth)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed (default: 42)')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume training from (default: None)')
     return parser.parse_args()
 
 
@@ -247,6 +259,8 @@ def main():
     print(f"  Learning rate: {args.lr}")
     print(f"  Hidden units: {args.hidden_units}")
     print(f"  Random seed: {args.seed}")
+    if args.resume:
+        print(f"  Resuming from: {args.resume}")
     
     # Download and prepare data
     print("\nDownloading dataset...")
@@ -264,6 +278,43 @@ def main():
         output_shape=num_classes
     ).to(device)
     
+    # Load checkpoint if resuming
+    train_accs, test_accs, train_losses, test_losses = [], [], [], []
+    if args.resume and os.path.exists(args.resume):
+        print(f"\nLoading checkpoint from {args.resume}...")
+        checkpoint = torch.load(args.resume)
+        
+        # Handle different checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            # New format with full training history and model weights
+            model.load_state_dict(checkpoint['model_state_dict'])
+            train_accs = checkpoint.get('train_accuracies', [])
+            test_accs = checkpoint.get('test_accuracies', [])
+            train_losses = checkpoint.get('train_losses', [])
+            test_losses = checkpoint.get('test_losses', [])
+            print(f"Resumed from epoch {len(train_accs)}")
+            print(f"Previous best accuracy: {checkpoint.get('best_accuracy', 0):.4f}%")
+        elif 'train_accuracies' in checkpoint:
+            # History file only (no model weights) - load from best_model.pth
+            print("Training history found, but no model weights in this file.")
+            model_path = os.path.join(args.save_dir, 'best_model.pth')
+            if os.path.exists(model_path):
+                print(f"Loading model weights from {model_path}...")
+                model.load_state_dict(torch.load(model_path))
+                train_accs = checkpoint.get('train_accuracies', [])
+                test_accs = checkpoint.get('test_accuracies', [])
+                train_losses = checkpoint.get('train_losses', [])
+                test_losses = checkpoint.get('test_losses', [])
+                print(f"Resumed from epoch {len(train_accs)}")
+                print(f"Previous best accuracy: {checkpoint.get('best_accuracy', 0):.4f}%")
+            else:
+                print(f"Warning: Could not find model weights at {model_path}")
+                print("Starting training from scratch")
+        else:
+            # Old format - just model weights (state_dict)
+            model.load_state_dict(checkpoint)
+            print("Loaded model weights from checkpoint")
+    
     print(model)
     
     # Train model
@@ -278,8 +329,9 @@ def main():
         save_dir=args.save_dir
     )
     
-    # Save training history
+    # Save training history with model state
     torch.save({
+        'model_state_dict': model.state_dict(),
         'train_accuracies': train_accs,
         'test_accuracies': test_accs,
         'train_losses': train_losses,

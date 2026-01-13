@@ -10,6 +10,70 @@ import matplotlib.pyplot as plt
 from train import WasteClassifierModelV1
 
 
+def load_model(model_path, num_classes, device='cpu'):
+    """
+    Load a trained model
+    
+    Args:
+        model_path: Path to the saved model
+        num_classes: Number of output classes
+        device: Device to load model on
+        
+    Returns:
+        Loaded model
+    """
+    model = WasteClassifierModelV1(
+        input_shape=3,
+        hidden_units=64,
+        output_shape=num_classes
+    ).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    return model
+
+
+def predict_image(model, image_path, classes, device='cpu'):
+    """
+    Predict the class of a single image
+    
+    Args:
+        model: Trained model
+        image_path: Path to the image
+        classes: List of class names
+        device: Device to run on
+        
+    Returns:
+        predicted_class, confidence, probabilities (list)
+    """
+    # Setup transforms
+    imagenet_mean = [0.485, 0.456, 0.406]
+    imagenet_std = [0.229, 0.224, 0.225]
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(imagenet_mean, imagenet_std)
+    ])
+    
+    # Load and preprocess image
+    image = Image.open(image_path).convert('RGB')
+    image_tensor = transform(image).unsqueeze(0).to(device)
+    
+    # Make prediction
+    with torch.inference_mode():
+        logits = model(image_tensor)
+        probabilities = torch.softmax(logits, dim=1)
+        confidence, predicted_idx = torch.max(probabilities, dim=1)
+    
+    predicted_class = classes[predicted_idx.item()]
+    confidence_value = confidence.item() * 100
+    
+    # Get all probabilities as list
+    all_probs = [probabilities[0][i].item() * 100 for i in range(len(classes))]
+    
+    return predicted_class, confidence_value, all_probs
+
+
 class WasteClassifier:
     """Wrapper class for easy predictions"""
     
